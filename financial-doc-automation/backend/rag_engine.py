@@ -1,16 +1,17 @@
 """
 RAG Engine Module
-FAISS-based vector store with sentence-transformers embeddings and Gemini LLM
+FAISS-based vector store with lightweight hashed embeddings and Gemini LLM
 for retrieval-augmented generation Q&A over financial documents.
 """
 
 import os
 import time
+import hashlib
+import re
 
 import faiss
 import numpy as np
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 
 load_dotenv()
@@ -39,8 +40,8 @@ class RAGEngine:
     """Retrieval-Augmented Generation engine using FAISS and Gemini."""
 
     def __init__(self):
-        """Initialize the embedding model, FAISS index placeholder, and Gemini model."""
-        self.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+        """Initialize embedding pipeline, FAISS index placeholder, and Gemini model."""
+        self.embedding_dim = 512
         self.index = None
         self.chunks: list[str] = []
 
@@ -52,6 +53,23 @@ class RAGEngine:
             genai.GenerativeModel(model_name=model_name, system_instruction=RAG_SYSTEM_PROMPT)
             for model_name in RAG_MODEL_CANDIDATES
         ]
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        return re.findall(r"[a-zA-Z0-9]+", text.lower())
+
+    def _encode_texts(self, texts: list[str]) -> np.ndarray:
+        """
+        Lightweight deterministic hashing embeddings to keep memory low in free hosting.
+        """
+        vectors = np.zeros((len(texts), self.embedding_dim), dtype=np.float32)
+        for i, text in enumerate(texts):
+            for token in self._tokenize(text):
+                digest = hashlib.md5(token.encode("utf-8")).digest()
+                index = int.from_bytes(digest[:4], byteorder="little") % self.embedding_dim
+                sign = 1.0 if (digest[4] % 2 == 0) else -1.0
+                vectors[i, index] += sign
+        return vectors
 
     def build_index(self, chunks: list[str]) -> None:
         """
@@ -71,14 +89,13 @@ class RAGEngine:
         self.chunks = chunks
 
         # Encode chunks into embeddings
-        embeddings = self.embed_model.encode(chunks)
-        embeddings = np.array(embeddings, dtype=np.float32)
+        embeddings = self._encode_texts(chunks)
 
         # Normalize for cosine similarity via inner product
         faiss.normalize_L2(embeddings)
 
         # Create FAISS index with inner product (cosine after normalization)
-        dimension = 384  # all-MiniLM-L6-v2 output dimension
+        dimension = self.embedding_dim
         self.index = faiss.IndexFlatIP(dimension)
         self.index.add(embeddings)
 
@@ -98,8 +115,7 @@ class RAGEngine:
 
         try:
             # Embed and normalize the question
-            q_embedding = self.embed_model.encode([question])
-            q_embedding = np.array(q_embedding, dtype=np.float32)
+            q_embedding = self._encode_texts([question])
             faiss.normalize_L2(q_embedding)
 
             # Search the FAISS index

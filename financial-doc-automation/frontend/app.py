@@ -5,12 +5,17 @@ Communicates with the FastAPI backend via HTTP requests.
 """
 
 import json
+import os
 
 import requests
 import streamlit as st
 
 # ── Configuration ──────────────────────────────────────────────────
-BACKEND_URL = "http://localhost:8000"
+BACKEND_URL = (
+    st.secrets.get("BACKEND_URL")
+    or os.getenv("BACKEND_URL")
+    or "http://localhost:8000"
+).rstrip("/")
 
 st.set_page_config(
     page_title="AI Financial Document Automation",

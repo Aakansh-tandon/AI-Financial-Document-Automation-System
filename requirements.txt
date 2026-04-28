@@ -1,6 +1,0 @@
-endee
-sentence-transformers
-pymupdf
-streamlit
-google-genai
-python-dotenv

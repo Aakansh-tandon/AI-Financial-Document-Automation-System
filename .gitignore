@@ -1,6 +1,9 @@
 # Environment variables (contains API keys)
 .env
 
+# financial-doc-automation — runtime generated data
+financial-doc-automation/data/extracted/results.json
+
 # Python virtual environments
 venv/
 .venv/

@@ -6,23 +6,43 @@ Communicates with the FastAPI backend via HTTP requests.
 
 import json
 import os
+from pathlib import Path
 
 import requests
 import streamlit as st
 
 # ── Configuration ──────────────────────────────────────────────────
-BACKEND_URL = (
-    st.secrets.get("BACKEND_URL")
-    or os.getenv("BACKEND_URL")
-    or "http://localhost:8000"
-).rstrip("/")
-
 st.set_page_config(
     page_title="AI Financial Document Automation",
     page_icon="📄",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def _has_streamlit_secrets_file() -> bool:
+    project_secret = Path.cwd() / ".streamlit" / "secrets.toml"
+    home = Path(os.path.expanduser("~"))
+    user_secret = home / ".streamlit" / "secrets.toml"
+    return project_secret.exists() or user_secret.exists()
+
+
+def _get_backend_url() -> str:
+    # Local/dev-first: avoid crashing when no secrets.toml exists.
+    env_url = os.getenv("BACKEND_URL")
+    if env_url:
+        return env_url.rstrip("/")
+    if _has_streamlit_secrets_file():
+        try:
+            secret_url = st.secrets["BACKEND_URL"]
+            if secret_url:
+                return str(secret_url).rstrip("/")
+        except Exception:
+            pass
+    return "http://localhost:8000"
+
+
+BACKEND_URL = _get_backend_url()
 
 # ── Custom CSS for premium styling ─────────────────────────────────
 st.markdown("""

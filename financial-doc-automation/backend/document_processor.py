@@ -20,12 +20,23 @@ class DocumentProcessor:
             return ""
 
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        # Normalize odd unicode dashes often found in PDF OCR/output.
+        normalized = re.sub(r"[\u2012\u2013\u2014\u2015]", "-", normalized)
         # Collapse repeated spaces/tabs.
         normalized = re.sub(r"[ \t]+", " ", normalized)
+        # Keep labels readable by preserving colon spacing.
+        normalized = re.sub(r"\s*:\s*", ": ", normalized)
         # Keep paragraph boundaries, but avoid noisy vertical spacing.
         normalized = re.sub(r"\n{3,}", "\n\n", normalized)
         # Merge hard-wrapped lines while preserving blank-line paragraph splits.
         normalized = re.sub(r"(?<!\n)\n(?!\n)", " ", normalized)
+
+        # Normalize noisy currency formatting, e.g. "$ 6 , 263 . 17" -> "$6,263.17"
+        normalized = re.sub(r"([$£€₹])\s+(?=\d)", r"\1", normalized)
+        normalized = re.sub(r"(?<=\d)\s*,\s*(?=\d{3}\b)", ",", normalized)
+        normalized = re.sub(r"(?<=\d)\s*\.\s*(?=\d{2}\b)", ".", normalized)
+        normalized = re.sub(r"(?<=\d)\s+(?=\d{3}\b)", "", normalized)
+
         return normalized.strip()
 
     def extract_text(self, pdf_bytes: bytes) -> str:

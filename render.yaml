@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: ai-financial-doc-backend
+    runtime: python
+    rootDir: financial-doc-automation
+    plan: free
+    buildCommand: pip install -r requirements-backend.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false

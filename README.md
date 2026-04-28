@@ -156,6 +156,34 @@ Frontend URL:
 
 ---
 
+## 7.1 Deploy backend on Render
+
+This repo includes `render.yaml` for one-click backend deployment.
+
+1. Push this repository to GitHub.
+2. In Render, create a **Blueprint** from the repo (it will detect `render.yaml`).
+3. Set required env var:
+   - `GEMINI_API_KEY`
+4. Deploy.
+
+The backend will run with:
+
+```bash
+uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+```
+
+Health check:
+
+- `https://<your-render-backend>.onrender.com/health`
+
+Then set Streamlit secret:
+
+```toml
+BACKEND_URL = "https://<your-render-backend>.onrender.com"
+```
+
+---
+
 ## 8. API reference
 
 ### `GET /health`

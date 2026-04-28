@@ -13,69 +13,23 @@ import google.generativeai as genai
 
 load_dotenv()
 
-# ═══════════════════════════════════════════════════════════════════
-# SAMPLE TEST INVOICE (for testing/reference)
-# ═══════════════════════════════════════════════════════════════════
-#
-# INVOICE
-# -------
-# Invoice Number: INV-2024-00742
-# Date: 2024-08-15
-#
-# From:
-#   Acme Cloud Services Ltd.
-#   123 Tech Park Drive
-#   San Francisco, CA 94105
-#
-# Bill To:
-#   Global Enterprises Inc.
-#   456 Corporate Blvd
-#   New York, NY 10001
-#
-# Description                    Qty    Unit Price     Total
-# ─────────────────────────────────────────────────────────────
-# Cloud Hosting (Annual)          1      $8,500.00    $8,500.00
-# Premium Support Package         1      $2,400.00    $2,400.00
-# Data Migration Service          1      $1,200.00    $1,200.00
-# ─────────────────────────────────────────────────────────────
-# Subtotal:                                          $12,100.00
-# Tax (8.5%):                                         $1,028.50
-# ─────────────────────────────────────────────────────────────
-# TOTAL DUE:                                         $13,128.50
-#
-# Payment Terms: Net 30
-# Due Date: 2024-09-14
-#
-# Please remit payment to:
-#   Bank: First National Bank
-#   Account: 9876543210
-#   Routing: 021000021
-#
-# Thank you for your business!
-# ═══════════════════════════════════════════════════════════════════
-
-
 SYSTEM_PROMPT = (
-    "You are an expert financial document parser. "
-    "Extract structured invoice fields with high precision. "
-    "Return valid JSON only. No markdown. No commentary."
+    "You are an expert financial document parser for invoices. "
+    "Return raw JSON only. Never include markdown, comments, or extra text."
 )
 
-USER_PROMPT_TEMPLATE = """Extract the following fields from this financial document.
-If a field is not found, use null for that field.
+USER_PROMPT_TEMPLATE = """Extract fields from this financial document.
 
-Field mapping rules:
-- invoice_number: look for "Invoice Number", "Invoice #", "Inv No", "Reference".
-- vendor: prefer explicit seller labels ("From", "Vendor", "Seller", "Billed By").
-  If not labeled, infer vendor from the top section (typically first business/entity name).
-- amount: pick the FINAL payable amount with this priority:
-  1) Balance Due / Amount Due / Total Due
-  2) Grand Total
-  3) Total
-  4) Subtotal (only if no higher-priority value exists)
-- due_date: look for "Due Date", "Payment Due", "Pay By", and return ISO YYYY-MM-DD if possible.
+Rules:
+1) Return valid JSON only.
+2) Use null for unknown values.
+3) Choose ONE final payable amount using this strict priority:
+   Balance Due > Amount Due > Total Due > Grand Total > Total > Subtotal.
+4) Vendor can be implicit. If no explicit seller label exists, infer the issuing company
+   from the top section before "Bill To".
+5) Due date should be YYYY-MM-DD when a clear date exists.
 
-Return ONLY this JSON structure, no other text:
+Return exactly:
 {{
   "invoice_number": "<string or null>",
   "vendor": "<string or null>",
@@ -84,19 +38,39 @@ Return ONLY this JSON structure, no other text:
 }}
 
 Document text:
-{text}"""
+{text}
+"""
 
 EXTRACTION_MODEL_CANDIDATES = (
     os.getenv("EXTRACTION_GEMINI_MODEL", "gemini-2.0-flash"),
     "gemini-1.5-flash-latest",
 )
 
+AMOUNT_PRIORITY = {
+    "balance_due": 6,
+    "amount_due": 5,
+    "total_due": 4,
+    "grand_total": 3,
+    "total": 2,
+    "subtotal": 1,
+}
+
+AMOUNT_LABEL_PATTERNS = (
+    ("balance_due", r"\bbalance\s+due\b"),
+    ("amount_due", r"\bamount\s+due\b"),
+    ("total_due", r"\btotal\s+due\b"),
+    ("grand_total", r"\bgrand\s+total\b"),
+    ("total", r"\btotal\b(?!\s*(?:tax|vat|items?|qty|quantity)\b)"),
+    ("subtotal", r"\bsub\s*total\b|\bsubtotal\b"),
+)
+
+MONEY_PATTERN = r"([$£€₹]?\s?\d[\d,\s]*(?:\.\s*\d{2})?)"
+
 
 class StructuredExtractor:
-    """Extracts structured financial data from document text using Gemini LLM."""
+    """Extracts structured financial data from document text using Gemini + rules."""
 
     def __init__(self):
-        """Initialize the Gemini model with API key from environment."""
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY not found in environment variables.")
@@ -117,12 +91,23 @@ class StructuredExtractor:
         }
 
     @staticmethod
-    def _prepare_text_for_llm(text: str, max_chars: int = 8000) -> str:
-        """Keep head+tail so footer fields (e.g., due date/total) are not dropped."""
-        clean = re.sub(r"\r\n?", "\n", text).strip()
-        clean = re.sub(r"[ \t]+", " ", clean)
-        clean = re.sub(r"\n{3,}", "\n\n", clean)
-        clean = re.sub(r"(?<!\n)\n(?!\n)", " ", clean)
+    def _normalize_for_rules(text: str) -> str:
+        cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"\s*:\s*", ": ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = re.sub(r"([$£€₹])\s+(?=\d)", r"\1", cleaned)
+        cleaned = re.sub(r"(?<=\d)\s*,\s*(?=\d{3}\b)", ",", cleaned)
+        cleaned = re.sub(r"(?<=\d)\s*\.\s*(?=\d{2}\b)", ".", cleaned)
+        cleaned = re.sub(r"(?<=\d)\s+(?=\d{3}\b)", "", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def _prepare_text_for_llm(text: str, max_chars: int = 7000) -> str:
+        """
+        Keep deterministic + bounded context. Preserve header/footer by using head+tail.
+        """
+        clean = StructuredExtractor._normalize_for_rules(text)
         if len(clean) <= max_chars:
             return clean
         half = max_chars // 2
@@ -130,7 +115,6 @@ class StructuredExtractor:
 
     @staticmethod
     def _parse_json_from_response(raw: str) -> dict | None:
-        """Parse model output as JSON, including responses wrapped in extra text."""
         if not raw:
             return None
         cleaned = raw.strip()
@@ -152,14 +136,13 @@ class StructuredExtractor:
 
     @staticmethod
     def _to_iso_date(value: str | None) -> str | None:
-        """Normalize common date formats to YYYY-MM-DD."""
         if value is None:
             return None
         candidate = str(value).strip()
         if not candidate:
             return None
 
-        formats = [
+        formats = (
             "%Y-%m-%d",
             "%m/%d/%Y",
             "%d/%m/%Y",
@@ -167,7 +150,7 @@ class StructuredExtractor:
             "%d-%m-%Y",
             "%b %d, %Y",
             "%B %d, %Y",
-        ]
+        )
         for fmt in formats:
             try:
                 return datetime.strptime(candidate, fmt).date().isoformat()
@@ -175,85 +158,122 @@ class StructuredExtractor:
                 continue
         return candidate if re.match(r"^\d{4}-\d{2}-\d{2}$", candidate) else None
 
-    def _regex_fallback_extract(self, text: str) -> dict:
-        """
-        Deterministic fallback extraction when LLM output is invalid/unavailable.
-        """
-        result = self._null_result()
+    @staticmethod
+    def _normalize_amount(value: str | None) -> str | None:
+        if value is None:
+            return None
+        amount = str(value).strip()
+        if not amount:
+            return None
+        amount = re.sub(r"\s+", "", amount)
+        amount = re.sub(r"(?<=\d),(?=\d{3}\b)", ",", amount)
+        amount = re.sub(r"(?<=\d)\.(?=\d{2}\b)", ".", amount)
+        amount = re.sub(r"(?<![$£€₹])(?=\d)", "", amount)
+        return amount
 
-        normalized_text = self._prepare_text_for_llm(text, max_chars=12000)
+    @staticmethod
+    def _amount_to_float(value: str | None) -> float:
+        if value is None:
+            return 0.0
+        cleaned = re.sub(r"[^0-9.]", "", value)
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0.0
 
-        invoice_match = re.search(
+    def _extract_invoice_number(self, text: str) -> str | None:
+        match = re.search(
             r"(?im)\b(?:invoice\s*(?:number|no|#)?|inv[#\s-]*|reference)\s*[:#-]?\s*([A-Z0-9-]{3,})\b",
-            normalized_text,
+            text,
         )
-        if invoice_match:
-            result["invoice_number"] = invoice_match.group(1).strip()
+        return match.group(1).strip() if match else None
 
-        vendor_match = re.search(
-            r"(?is)\b(?:from|vendor|seller|billed\s+by)\b\s*:\s*\n?\s*([^\n,]{2,80})",
-            normalized_text,
+    def _extract_due_date(self, text: str) -> str | None:
+        match = re.search(
+            r"(?im)\b(?:due\s*date|payment\s*due|pay\s*by)\b\s*[:\-]?\s*([A-Za-z0-9,/\- ]{6,30})",
+            text,
         )
-        if not vendor_match:
-            vendor_match = re.search(
-                r"(?im)^\s*(?:from|vendor|seller|billed\s+by)\s*:\s*([^\n]{2,80})\s*$",
-                normalized_text,
-            )
-        if not vendor_match:
-            top_window = normalized_text[:1500]
-            for line in [ln.strip() for ln in re.split(r"\n+", top_window) if ln.strip()]:
+        if not match:
+            return None
+        return self._to_iso_date(match.group(1))
+
+    def _extract_vendor(self, text: str) -> str | None:
+        patterns = (
+            r"(?im)^\s*(?:from|vendor|seller|billed\s+by|issued\s+by)\s*:\s*([^\n]{2,100})$",
+            r"(?is)\b(?:from|vendor|seller|billed\s+by|issued\s+by)\b\s*:\s*\n?\s*([^\n,]{2,100})",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                candidate = match.group(1).strip(" -,:")
+                if candidate:
+                    return candidate
+
+        # Positional heuristic: first meaningful entity before "Bill To"
+        bill_to_match = re.search(r"(?im)\bbill\s*to\b", text)
+        top_region = text[: bill_to_match.start()] if bill_to_match else text[:1500]
+        lines = [ln.strip(" -,:") for ln in top_region.splitlines() if ln.strip()]
+
+        for line in lines:
+            low = line.lower()
+            if any(token in low for token in ("invoice", "date", "due", "amount", "total", "ship to", "bill to")):
+                continue
+            if re.search(r"\b(?:inc|llc|ltd|limited|corp|corporation|company|co\.)\b", line, re.I):
+                return line
+
+        invoice_header_idx = next((i for i, ln in enumerate(lines) if re.search(r"\binvoice\b", ln, re.I)), None)
+        if invoice_header_idx is not None:
+            for line in lines[invoice_header_idx + 1 :]:
                 low = line.lower()
-                if any(
-                    token in low for token in
-                    ["invoice", "bill to", "due date", "amount due", "total", "po ", "ship to"]
-                ):
+                if any(token in low for token in ("bill to", "invoice #", "invoice number", "date", "due")):
                     continue
-                if re.search(r"[A-Za-z]{2,}", line):
-                    vendor_match = re.search(r"(.+)", line)
-                    break
-        if vendor_match:
-            result["vendor"] = vendor_match.group(1).strip()
+                if re.search(r"[A-Z][A-Za-z&.,'\- ]{2,}", line):
+                    return line
+        return None
 
-        amount_patterns = [
-            r"(?im)\b(?:balance\s+due|amount\s+due|total\s+due)\b\s*[:\-]?\s*([$£€₹]\s?\d[\d,]*(?:\.\d{2})?)",
-            r"(?im)\b(?:grand\s+total)\b\s*[:\-]?\s*([$£€₹]\s?\d[\d,]*(?:\.\d{2})?)",
-            r"(?im)\b(?:total)\b\s*[:\-]?\s*([$£€₹]\s?\d[\d,]*(?:\.\d{2})?)",
-            r"(?im)\b(?:subtotal)\b\s*[:\-]?\s*([$£€₹]\s?\d[\d,]*(?:\.\d{2})?)",
-            r"(?im)\b(?:balance\s+due|amount\s+due|total\s+due)\b\s*[:\-]?\s*(\d[\d,]*(?:\.\d{2})?)",
-            r"(?im)\b(?:grand\s+total)\b\s*[:\-]?\s*(\d[\d,]*(?:\.\d{2})?)",
-            r"(?im)\b(?:total)\b\s*[:\-]?\s*(\d[\d,]*(?:\.\d{2})?)",
-            r"(?im)\b(?:subtotal)\b\s*[:\-]?\s*(\d[\d,]*(?:\.\d{2})?)",
-        ]
-        for pattern in amount_patterns:
-            amount_match = re.search(pattern, normalized_text)
-            if amount_match:
-                result["amount"] = amount_match.group(1).strip()
-                break
+    def _extract_amount_candidates(self, text: str) -> list[dict]:
+        candidates: list[dict] = []
+        normalized = self._normalize_for_rules(text)
+        for label, label_pattern in AMOUNT_LABEL_PATTERNS:
+            pattern = re.compile(
+                rf"(?im){label_pattern}\s*[:\-]?\s*{MONEY_PATTERN}",
+            )
+            matches = list(pattern.finditer(normalized))
+            if not matches:
+                continue
+            for match in matches:
+                amount = self._normalize_amount(match.group(1))
+                if amount:
+                    candidates.append(
+                        {
+                            "label": label,
+                            "amount": amount,
+                            "priority": AMOUNT_PRIORITY[label],
+                            "position": match.start(),
+                        }
+                    )
+        return candidates
 
-        if result["amount"] is None:
-            # Fallback: choose the largest currency value if no label-driven amount found.
-            currency_values = re.findall(r"[$£€₹]\s?\d[\d,]*(?:\.\d{2})?", normalized_text)
-            if currency_values:
-                def _to_float(value: str) -> float:
-                    cleaned = re.sub(r"[^0-9.]", "", value)
-                    try:
-                        return float(cleaned)
-                    except ValueError:
-                        return 0.0
+    def _choose_final_amount(self, text: str) -> tuple[str | None, str | None]:
+        candidates = self._extract_amount_candidates(text)
+        if candidates:
+            # Highest priority first; for same label prefer the last occurrence.
+            best = sorted(candidates, key=lambda c: (c["priority"], c["position"]), reverse=True)[0]
+            return best["amount"], best["label"]
 
-                result["amount"] = max(currency_values, key=_to_float).strip()
+        # Fallback: choose max currency value when no labels are available.
+        normalized = self._normalize_for_rules(text)
+        values = re.findall(r"[$£€₹]\s?\d[\d,]*(?:\.\d{2})?", normalized)
+        if values:
+            amounts = [self._normalize_amount(v) for v in values]
+            amounts = [a for a in amounts if a]
+            if amounts:
+                best_amount = max(amounts, key=self._amount_to_float)
+                return best_amount, "max_currency_fallback"
 
-        due_match = re.search(
-            r"(?im)\b(?:due\s*date|payment\s*due)\b\s*[:\-]?\s*([A-Za-z0-9,/\- ]{6,30})",
-            normalized_text,
-        )
-        if due_match:
-            result["due_date"] = self._to_iso_date(due_match.group(1))
-        result["confidence_score"] = self._compute_dynamic_confidence(result)
-        return result
+        return None, None
 
     def _normalize_result(self, parsed: dict | None) -> dict:
-        """Normalize model payload to expected schema and types."""
         result = self._null_result()
         if not isinstance(parsed, dict):
             return result
@@ -264,55 +284,91 @@ class StructuredExtractor:
                 value = str(value).strip()
                 result[key] = value if value else None
 
+        result["amount"] = self._normalize_amount(result["amount"])
         result["due_date"] = self._to_iso_date(result["due_date"])
-
-        confidence = parsed.get("confidence_score")
-        if confidence is not None:
-            try:
-                confidence = float(confidence)
-                result["confidence_score"] = min(max(confidence, 0.0), 1.0)
-            except (ValueError, TypeError):
-                pass
-
         return result
 
-    def _merge_results(self, llm_result: dict, regex_result: dict) -> dict:
-        merged = self._null_result()
-        for key in ("invoice_number", "vendor", "amount", "due_date"):
-            merged[key] = llm_result.get(key) or regex_result.get(key)
-        merged["confidence_score"] = self._compute_dynamic_confidence(merged)
-        return merged
+    def _regex_fallback_extract(self, text: str) -> tuple[dict, str | None]:
+        normalized = self._normalize_for_rules(text)
+        result = self._null_result()
+        result["invoice_number"] = self._extract_invoice_number(normalized)
+        result["vendor"] = self._extract_vendor(normalized)
+        result["amount"], amount_label = self._choose_final_amount(normalized)
+        result["due_date"] = self._extract_due_date(normalized)
+        return result, amount_label
 
-    @staticmethod
-    def _compute_dynamic_confidence(result: dict) -> float:
+    def _merge_results(self, llm_result: dict, rule_result: dict, text: str, rule_amount_label: str | None) -> tuple[dict, str | None]:
+        merged = self._null_result()
+        for key in ("invoice_number", "vendor", "due_date"):
+            merged[key] = llm_result.get(key) or rule_result.get(key)
+
+        llm_amount = llm_result.get("amount")
+        rule_amount = rule_result.get("amount")
+        final_amount = llm_amount or rule_amount
+        final_label = None
+
+        # Critical guard: if a higher-priority deterministic amount exists, prefer it.
+        if rule_amount:
+            if not llm_amount:
+                final_amount = rule_amount
+                final_label = rule_amount_label
+            else:
+                llm_label = self._infer_amount_label_from_text(text, llm_amount)
+                llm_priority = AMOUNT_PRIORITY.get(llm_label, 0)
+                rule_priority = AMOUNT_PRIORITY.get(rule_amount_label, 0)
+                if rule_priority >= llm_priority:
+                    final_amount = rule_amount
+                    final_label = rule_amount_label
+                else:
+                    final_label = llm_label
+        else:
+            final_label = self._infer_amount_label_from_text(text, final_amount)
+
+        merged["amount"] = final_amount
+        merged["confidence_score"] = self._compute_confidence(merged, text, final_label)
+        return merged, final_label
+
+    def _infer_amount_label_from_text(self, text: str, amount: str | None) -> str | None:
+        if not amount:
+            return None
+        normalized = self._normalize_for_rules(text)
+        escaped_amount = re.escape(amount).replace(r"\,", r",")
+        for label, label_pattern in AMOUNT_LABEL_PATTERNS:
+            if re.search(rf"(?im){label_pattern}\s*[:\-]?\s*{escaped_amount}", normalized):
+                return label
+        return None
+
+    def _compute_confidence(self, result: dict, text: str, amount_label: str | None) -> float:
         populated = sum(
             1
             for field in ("invoice_number", "vendor", "amount", "due_date")
             if result.get(field) is not None
         )
-        return round(populated / 4, 2)
+        score = populated / 4
+
+        # Penalize if higher-priority "Balance Due" exists but selected amount is lower priority.
+        normalized = self._normalize_for_rules(text)
+        has_balance_due = bool(re.search(r"(?im)\bbalance\s+due\b", normalized))
+        if has_balance_due and amount_label and amount_label != "balance_due":
+            score -= 0.20
+        elif has_balance_due and result.get("amount") is None:
+            score -= 0.25
+
+        return round(max(0.0, min(1.0, score)), 2)
 
     def extract(self, text: str) -> dict:
         """
         Extract structured financial data from document text.
-
-        Args:
-            text: The full document text to process.
-
-        Returns:
-            Dictionary with extracted fields: invoice_number, vendor,
-            amount, due_date, confidence_score.
         """
-        null_result = self._null_result()
-
         if not text or not text.strip():
-            return null_result
+            return self._null_result()
 
-        llm_result = null_result
+        llm_result = self._null_result()
         try:
             prepared_text = self._prepare_text_for_llm(text)
             user_prompt = USER_PROMPT_TEMPLATE.format(text=prepared_text)
             last_error = None
+
             for model in self.models:
                 try:
                     response = model.generate_content(
@@ -331,11 +387,12 @@ class StructuredExtractor:
                     if "not found" in str(model_error).lower():
                         continue
                     raise
-            if last_error and llm_result == null_result:
+
+            if last_error and llm_result == self._null_result():
                 raise RuntimeError(str(last_error))
         except Exception as e:
             print(f"[Extractor Error] {str(e)}")
 
-        regex_result = self._regex_fallback_extract(text)
-        merged = self._merge_results(llm_result, regex_result)
+        rule_result, rule_amount_label = self._regex_fallback_extract(text)
+        merged, _ = self._merge_results(llm_result, rule_result, text, rule_amount_label)
         return merged

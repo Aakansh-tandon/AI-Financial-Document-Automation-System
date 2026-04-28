@@ -5,6 +5,7 @@ for retrieval-augmented generation Q&A over financial documents.
 """
 
 import os
+import time
 
 import faiss
 import numpy as np
@@ -31,6 +32,7 @@ RAG_MODEL_CANDIDATES = (
     os.getenv("RAG_GEMINI_MODEL", "gemini-2.0-flash"),
     "gemini-1.5-flash-latest",
 )
+RAG_MAX_RETRIES_PER_MODEL = 2
 
 
 class RAGEngine:
@@ -120,20 +122,27 @@ class RAGEngine:
             answer = None
             last_error = None
             for model in self.llm_models:
-                try:
-                    response = model.generate_content(
-                        user_prompt,
-                        generation_config={"temperature": 0.1},
-                    )
-                    answer = (response.text or "").strip()
-                    if answer:
+                for attempt in range(RAG_MAX_RETRIES_PER_MODEL):
+                    try:
+                        response = model.generate_content(
+                            user_prompt,
+                            generation_config={"temperature": 0},
+                        )
+                        answer = (response.text or "").strip()
+                        if answer:
+                            break
+                        last_error = RuntimeError("Model returned empty response.")
+                    except Exception as e:
+                        last_error = e
+                        # Retry same model for transient errors, then fallback.
+                        if "not found" in str(e).lower():
+                            break
+                        if attempt < RAG_MAX_RETRIES_PER_MODEL - 1:
+                            time.sleep(1.5 * (attempt + 1))
+                            continue
                         break
-                except Exception as e:
-                    last_error = e
-                    # Try next model if current one is unavailable.
-                    if "not found" in str(e).lower():
-                        continue
-                    raise
+                if answer:
+                    break
 
             if not answer:
                 if last_error:

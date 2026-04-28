@@ -1,11 +1,5 @@
-fastapi==0.111.0
-uvicorn==0.30.1
-python-multipart==0.0.9
-pymupdf>=1.26.0,<1.27
-faiss-cpu==1.13.2
-sentence-transformers==3.0.1
-google-generativeai==0.7.2
-python-dotenv==1.0.1
-streamlit==1.36.0
-numpy==1.26.4
+# Streamlit Cloud installs this file when deploying frontend/app.py.
+# Keep this list frontend-only to avoid backend ML build failures on hosted envs.
+streamlit>=1.40
 requests==2.32.3
+python-dotenv==1.0.1
